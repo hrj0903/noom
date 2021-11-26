@@ -1,9 +1,9 @@
 //http는 nodejs에 내장되어있음.
 import http from 'http';
-import WebSocket, { WebSocketServer } from 'ws';
+import { Server } from 'socket.io';
+//백엔드를 위한 admin ui
+import { instrument } from '@socket.io/admin-ui';
 import express from 'express';
-import { SocketAddress } from 'net';
-
 const app = express();
 
 app.set('view engine', 'pug');
@@ -14,42 +14,71 @@ app.use('/public', express.static(__dirname + '/public'));
 app.get('/', (_, res) => res.render('home'));
 app.get('/*', (_, res) => res.redirect('/'));
 
-const handleListen = () => console.log(`Listening on http://localhost:3000`);
-
-//서버 생성.
-//express는 ws를 지원안하므로 이렇게 작성하는 거임.
-//아래 두개의 코드는 필수사항 아님. websocket만 만들어도 됨.
-//http와 WebSocket이 같은 port에 있길 원하기 때문에 이렇게 작성.
-//http를 설정한 이유는 views,static files, home, redirect를 원하기 때문에 만듬.
-const server = http.createServer(app);
-//웹소켓 서버 생성.
-//이렇게 작성하면 같은 서버에서 http, webSocket 둘 다 작동
-//express.js위에 http, http위에 websocket서버 만듬.
-const wss = new WebSocketServer({ server });
-
-//브라우저마다 소켓을 보내기 위한 데이터베이스 역할.
-const sockets = [];
-
-//socket이 frontend와 real-time으로 소통할 수 있음.
-wss.on('connection', (socket) => {
-  sockets.push(socket);
-  socket['nickname'] = 'Anon';
-  console.log('Connected to Browser ✅');
-  socket.on('close', () => console.log('Disconnected from the Browser ❌'));
-  socket.on('message', (msg) => {
-    const message = JSON.parse(msg);
-    switch (message.type) {
-      case 'new_message':
-        sockets.forEach((aSocket) =>
-          aSocket.send(`${socket.nickname}: ${message.payload}`)
-        );
-        break;
-      case 'nickname':
-        // socket은 기본적으로 객체여서 아래와 정보를 넣을 수 있음.
-        socket['nickname'] = message.payload;
-        break;
-    }
-  });
+const httpServer = http.createServer(app);
+const wsServer = new Server(httpServer, {
+  cors: {
+    origin: ['https://admin.socket.io'],
+    credentials: true,
+  },
 });
 
-server.listen(3000, handleListen);
+instrument(wsServer, {
+  auth: false,
+});
+
+function publicRooms() {
+  const {
+    sockets: {
+      // apater는 다른 서버들 사이에 실시간 어플리케이션을 동기화
+      adapter: { sids, rooms },
+    },
+  } = wsServer;
+  const publicRooms = [];
+  rooms.forEach((_, key) => {
+    // room id를 socket id에서 찾을 수 없다면 public room
+    if (sids.get(key) === undefined) {
+      publicRooms.push(key);
+    }
+  });
+  return publicRooms;
+}
+
+function countRoom(roomName) {
+  return wsServer.sockets.adapter.rooms.get(roomName)?.size;
+}
+
+wsServer.on('connection', (socket) => {
+  socket['nickname'] = 'Anon';
+  socket.onAny((event) => {
+    console.log(`Socket Event: ${event}`);
+  });
+  socket.on('enter_room', (roomName, done) => {
+    socket.join(roomName);
+    //done은 프론트에서 마지막 인수를 뜻함.
+    //done func 실행시키면 프론트엔드에서 func 실행
+    done();
+    socket.to(roomName).emit('welcome', socket.nickname, countRoom(roomName));
+    // message를 연결된 모든 socket에게 보내줌
+    wsServer.sockets.emit('room_change', publicRooms());
+  });
+  //disconnecting은 원래 있는 이벤트이름.
+  //sokcet이 방을 떠나기 바로 직전에 발생.
+  socket.on('disconnecting', () => {
+    //프론트에 emit
+    socket.rooms.forEach((room) =>
+      socket.to(room).emit('bye', socket.nickname, countRoom(room) - 1)
+    );
+  });
+  socket.on('disconnect', () => {
+    wsServer.sockets.emit('room_change', publicRooms());
+  });
+  // 프론트와 백엔드의 이벤트 이름이 같아도 상관없음.
+  socket.on('new_message', (msg, room, done) => {
+    socket.to(room).emit('new_message', `${socket.nickname}: ${msg}`);
+    done();
+  });
+  socket.on('nickname', (nickname) => (socket['nickname'] = nickname));
+});
+
+const handleListen = () => console.log(`Listening on http://localhost:3000`);
+httpServer.listen(3000, handleListen);
